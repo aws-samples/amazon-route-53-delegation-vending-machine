@@ -1,0 +1,491 @@
+# Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# https://aws.amazon.com/agreement
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Create a Route 53 Delegation Vending Machine in an account which manages parent hosted zone(s).  The vending machine
+  will delegate from the parent Route 53 hosted zone(s) to the Route 53 hosted zones it creates in a specified target
+  account.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: General Configuration
+        Parameters:
+          - pDelegationVendingMachineAccount
+          - pDelegationFileResourceBucket
+      -
+        Label:
+          default: Permissions Configuration
+        Parameters:
+          - pStackSetAdministrationRoleName
+          - pTargetAssumedRoleOUIds
+          - pStackSetExecutionRoleName
+      -
+        Label:
+          default: Service Catalog Product Configuration
+        Parameters:
+          - pServiceCatalogDistributor
+          - pServiceCatalogOwner
+          - pServiceCatalogSupportEmail
+          - pServiceCatalogPortfolioId
+    ParameterLabels:
+      pDelegationFileResourceBucket:
+        default: File Resource Location
+      pDelegationVendingMachineAccount:
+        default: Vending Machine Account ID
+      pServiceCatalogDistributor:
+        default: Vendor
+      pServiceCatalogOwner:
+        default: Provider
+      pServiceCatalogPortfolioId:
+        default: Portfolio ID
+      pServiceCatalogSupportEmail:
+        default: Support Email
+      pStackSetAdministrationRoleName:
+        default: Administration Role
+      pStackSetExecutionRoleName:
+        default: Execution Role Name
+      pTargetAssumedRoleOUIds:
+        default: Subdomain Zone OU IDs
+
+Parameters:
+  pDelegationFileResourceBucket:
+    Type: String
+    AllowedPattern: ^[a-z\d][a-z\d\-]*(?<!-)(?:\.(?!-)[a-z\d\-]+(?<!-))*(?<!\.)$
+    Description: The S3 bucket where the additional package resource files may be located.
+
+  pDelegationVendingMachineAccount:
+    Type: String
+    AllowedPattern: ^\d{12}$
+    Description: >-
+      The account within which the Route 53 Delegation Vending Machine will be created.  This should be the account
+      that contains the parent Route 53 hosted zone.
+
+  pServiceCatalogDistributor:
+    Type: String
+    Description: The person or organization that is the distributor of this Service Catalog product.
+
+  pServiceCatalogOwner:
+    Type: String
+    Description: The person or organization that owns this Service Catalog product.
+
+  pServiceCatalogPortfolioId:
+    Type: String
+    AllowedPattern: ^port-\w+$
+    Description: >-
+      A Service Catalog portfolio ID available in the account where the Route 53 Delegation Vending Machine will be
+      created with which to associate the created Service Catalog product.
+
+  pServiceCatalogSupportEmail:
+    Type: String
+    Description: The email address that will be used for support inquiries for this Service Catalog product.
+
+  pStackSetAdministrationRoleName:
+    Type: String
+    AllowedPattern: ^[\w+=,.@\-/]{1,64}$
+    Default: service-role/AWSControlTowerStackSetRole
+    Description: >-
+      The name of the administration IAM role on this account that will be used to deploy the CloudFormation StackSet
+      resources for this template.  Include any additional path information aside from the initial "role/".  The
+      default value is set for a Control Tower-generated IAM role.
+
+  pStackSetExecutionRoleName:
+    Type: String
+    AllowedPattern: ^[\w+=,.@\-]{1,64}$
+    Default: AWSControlTowerExecution
+    Description: >-
+      The name of the execution IAM role within the specified AWS Organizations organizational units that will be used
+      to deploy the CloudFormation StackSet resources for this template.  The default value is set for a Control
+      Tower-generated IAM role.
+
+  pTargetAssumedRoleOUIds:
+    Type: CommaDelimitedList
+    Description: >-
+      A comma-separated list of AWS Organizations organizational unit IDs which may have delegated subdomain Route 53
+      hosted zones created within them.
+
+Resources:
+  rDelegationVendingMachineStackSet:
+    Type: AWS::CloudFormation::StackSet
+    Properties:
+      AdministrationRoleARN: !Sub arn:aws:iam::${ AWS::AccountId }:role/${ pStackSetAdministrationRoleName }
+      Capabilities:
+        - CAPABILITY_NAMED_IAM
+      Description: Deploy the infrastructure for the Route 53 Delegation Vending Machine.
+      ExecutionRoleName: !Ref pStackSetExecutionRoleName
+      PermissionModel: SELF_MANAGED
+      StackInstancesGroup:
+        -
+          DeploymentTargets:
+            Accounts:
+              - !Ref pDelegationVendingMachineAccount
+          Regions:
+            - !Ref AWS::Region
+      StackSetName: !Sub Route53DelegationVendingMachine-${ AWS::StackName }
+      TemplateBody: !Sub |-
+        AWSTemplateFormatVersion: 2010-09-09
+        Description: Deploy the infrastructure needed for the Route 53 Delegation Vending Machine.
+
+        Resources:
+          rLambdaFunction:
+            Type: AWS::Lambda::Function
+            Metadata:
+              cfn_nag:
+                rules_to_suppress:
+                  -
+                    id: W58
+                    reason: >-
+                      The function does have permission to write to CloudWatch Logs; however, a managed policy is not
+                      being used in order to further tighten access.
+                  -
+                    id: W89
+                    reason: VPC access is not required for the Lambda function.
+                  -
+                    id: W92
+                    reason: Reserved concurrency is not required.
+            Properties:
+              Code:
+                ZipFile: |
+                  import boto3
+                  import cfnresponse
+                  import logging
+                  import time
+
+                  from traceback import print_exc
+
+                  logger = logging.getLogger()
+                  logger.setLevel(logging.INFO)
+
+                  boto3_session = boto3.session.Session()
+                  route53_client = boto3_session.client("route53")
+                  sts_client = boto3_session.client("sts")
+
+
+                  def create_delegate_hosted_zone(
+                      parent_account: str,
+                      target_account: str,
+                      parent_hosted_zone_id: str,
+                      subdomain_zone_name: str
+                  ) -> None:
+                      """Manages creation of and delegation to a subdomain Route 53 hosted zone.
+                      AWS STS is used to assume an IAM role in the target_account (deployed as
+                      part of the Route 53 Delegation Vending Machine baseline template) and
+                      generate temporary credentials.  These credentials will then be used to
+                      create the relevant subdomain Route 53 hosted zone; details from this new
+                      subdomain hosted zone will be used to then create the delegation "NS"
+                      record set in the parent hosted zone.
+
+                      If an error occurs in creating the delegation "NS" record set, the
+                      subdomain Route 53 hosted zone will be deleted as a result to ensure no
+                      orphan hosted zones are left behind.
+
+                      :param parent_account:
+                          The AWS account ID for the account which contains the parent Route 53
+                          hosted zone.  This is the same account that contains the Route 53
+                          Delegation Vending Machine Lambda function.
+                      :param target_account:
+                          The AWS account ID for the account which will have the subdomain Route
+                          53 hosted zone created within it.
+                      :param parent_hosted_zone_id:
+                          The Route 53 hosted zone ID for the parent hosted zone delegating to
+                          the subdomain hosted zone created in this method.
+                      :param subdomain_zone_name:
+                          The fully-qualified name for the subdomain Route 53 hosted zone.
+                      :return: None
+                      """
+                      credentials = sts_client.assume_role(
+                          RoleArn=(
+                              f"arn:aws:iam::{target_account}:role/"
+                              f"Route53DelegationVendingMachineRole-{parent_account}"
+                          ),
+                          RoleSessionName=f"r53-delegation-{int(time.time())}"
+                      )["Credentials"]
+
+                      route53_client_target = boto3_session.client(
+                          "route53",
+                          aws_access_key_id=credentials["AccessKeyId"],
+                          aws_secret_access_key=credentials["SecretAccessKey"],
+                          aws_session_token=credentials["SessionToken"]
+                      )
+
+                      subdomain_hosted_zone = create_hosted_zone(
+                          route53_client_target,
+                          subdomain_zone_name
+                      )
+
+                      try:
+                          delegate_hosted_zone(
+                              subdomain_zone_name,
+                              parent_hosted_zone_id,
+                              subdomain_hosted_zone["NameServers"]
+                          )
+
+                      except Exception:
+                          route53_client_target.delete_hosted_zone(
+                              Id=subdomain_hosted_zone["HostedZoneId"]
+                          )
+
+                          raise
+
+
+                  def create_hosted_zone(
+                      route53_client_target: "botocore.client.Route53",
+                      subdomain_zone_name: str
+                  ) -> dict:
+                      """Creates the subdomain Route 53 hosted zone in the target account and
+                      returns specific details about it.
+
+                      :param route53_client_target:
+                          The boto3 Route 53 client that has assumed an IAM role in the target
+                          account.
+                      :param subdomain_zone_name:
+                          The fully-qualified name for the subdomain Route 53 hosted zone.
+                      :return:
+                          Details about the subdomain hosted zone (the hosted zone ID and the
+                          delegation set).
+                      """
+                      subdomain_hosted_zone = route53_client_target.create_hosted_zone(
+                          CallerReference=str(time.time()),
+                          Name=subdomain_zone_name
+                      )
+
+                      return {
+                          "HostedZoneId": subdomain_hosted_zone["HostedZone"]["Id"],
+                          "NameServers": [
+                              {
+                                  "Value": name_server
+                              } for name_server
+                              in subdomain_hosted_zone["DelegationSet"]["NameServers"]
+                          ]
+                      }
+
+
+                  def delegate_hosted_zone(
+                      subdomain_zone_name: str,
+                      parent_hosted_zone_id: str,
+                      subdomain_name_servers: list[str]
+                  ) -> None:
+                      """Creates the delegation "NS" record set in the parent Route 53 hosted
+                      zone.
+
+                      :param subdomain_zone_name:
+                          The fully-qualified name for the subdomain Route 53 hosted zone.
+                      :param parent_hosted_zone_id:
+                          The Route 53 hosted zone ID for the parent hosted zone delegating to
+                          the subdomain hosted zone created in this method.
+                      :param subdomain_name_servers:
+                          The name servers assigned to the subdomain Route 53 hosted zone.
+                      :return: None
+                      """
+                      route53_client.change_resource_record_sets(
+                          ChangeBatch={
+                              "Changes": [{
+                                  "Action": "UPSERT",
+                                  "ResourceRecordSet": {
+                                      "Name": subdomain_zone_name,
+                                      "ResourceRecords": subdomain_name_servers,
+                                      "TTL": 86400,
+                                      "Type": "NS"
+                                  }
+                              }]
+                          },
+                          HostedZoneId=parent_hosted_zone_id
+                      )
+
+
+                  def handler(event: dict, context: dict) -> None:
+                      """The entrypoint for the Route 53 Delegation Vending Machine Lambda
+                      function.
+
+                      :param event: The execution event details.
+                      :param context: The environment execution context.
+                      :return: None
+                      """
+                      properties = event["ResourceProperties"]
+                      request_type = event["RequestType"]
+
+                      status = cfnresponse.SUCCESS
+
+                      try:
+                          if request_type in ("Create"):
+                              parent_account = properties["ParentAccount"]
+                              parent_hosted_zone_id = properties["ParentHostedZoneId"]
+                              subdomain_zone_name = properties["SubdomainZoneName"]
+                              target_account = properties["TargetAccount"]
+
+                              create_delegate_hosted_zone(
+                                  parent_account,
+                                  target_account,
+                                  parent_hosted_zone_id,
+                                  subdomain_zone_name
+                              )
+
+                      except Exception:
+                          status = cfnresponse.FAILED
+
+                          print_exc()
+
+                      cfnresponse.send(event, context, status, {})
+
+              Description: >-
+                The Route 53 Delegation Vending Machine will create a Route 53 hosted zone in a specified account and
+                create a delegation NS record to said zone in the parent zone found on this account.
+              FunctionName: Route53DelegationVendingMachine
+              Handler: index.handler
+              Role: !GetAtt rLambdaFunctionIAMRole.Arn
+              Runtime: python3.9
+              Timeout: 300
+
+          rLambdaFunctionIAMRole:
+            Type: AWS::IAM::Role
+            Metadata:
+              cfn_nag:
+                rules_to_suppress:
+                  -
+                    id: W11
+                    reason: >-
+                      The * resource is required for the route53:ChangeResourceRecordSets action due to the nature of
+                      the solution.
+                  -
+                    id: W28
+                    reason: This resource is named due to being referenced in an IAM role separate from this template.
+            Properties:
+              AssumeRolePolicyDocument:
+                Statement:
+                  -
+                    Action:
+                      - sts:AssumeRole
+                    Effect: Allow
+                    Principal:
+                      Service:
+                        - lambda.amazonaws.com
+                Version: 2012-10-17
+              Policies:
+                -
+                  PolicyDocument:
+                    Statement:
+                      -
+                        Action:
+                          - logs:CreateLogGroup
+                        Effect: Allow
+                        Resource:
+                          - !Sub arn:${ AWS::Partition }:logs:${! AWS::Region }:${ AWS::AccountId }:log-group:/aws/lambda/Route53DelegationVendingMachine
+                      -
+                        Action:
+                          - logs:CreateLogStream
+                          - logs:PutLogEvents
+                        Effect: Allow
+                        Resource:
+                          - !Sub arn:${ AWS::Partition }:logs:${! AWS::Region }:${ AWS::AccountId }:log-group:/aws/lambda/Route53DelegationVendingMachine:log-stream:*
+                      -
+                        Action:
+                          - route53:ChangeResourceRecordSets
+                        Effect: Allow
+                        Resource: "*"
+                      -
+                        Action:
+                          - sts:AssumeRole
+                        Effect: Allow
+                        Resource:
+                          - arn:aws:iam::*:role/Route53DelegationVendingMachineRole-${ pDelegationVendingMachineAccount }
+                    Version: 2012-10-17
+                  PolicyName: Route53DelegationVendingMachineExecutionRolePolicy
+              RoleName: Route53DelegationVendingMachineExecutionRole
+
+          rLambdaFunctionLogsLogGroup:
+            Type: AWS::Logs::LogGroup
+            Metadata:
+              cfn_nag:
+                rules_to_suppress:
+                  -
+                    id: W84
+                    reason: Encrypting the simple Lambda function output for this narrow use-case is not required.
+            Properties:
+              LogGroupName: /aws/lambda/Route53DelegationVendingMachine
+              RetentionInDays: 14
+
+          rServiceCatalogPortfolioProductAssociation:
+            Type: AWS::ServiceCatalog::PortfolioProductAssociation
+            Properties:
+              PortfolioId: ${ pServiceCatalogPortfolioId }
+              ProductId: !Ref rServiceCatalogCloudFormationProduct
+
+          rServiceCatalogCloudFormationProduct:
+            Type: AWS::ServiceCatalog::CloudFormationProduct
+            Properties:
+              Description: >-
+                A Service Catalog product which creates and delegates subdomains for specified parent Route 53 hosted
+                zones.
+              Distributor: ${ pServiceCatalogDistributor }
+              Name: Route 53 Delegation Vending Machine
+              Owner: ${ pServiceCatalogOwner }
+              ProvisioningArtifactParameters:
+                -
+                  Info:
+                    LoadTemplateFromURL: https://${ pDelegationFileResourceBucket }.s3.${ AWS::Region }.amazonaws.com/route_53_delegation_vending_machine.product.template.yml
+                  Name: v1.0.0
+              SupportEmail: ${ pServiceCatalogSupportEmail }
+
+          rSSMParameter:
+            Type: AWS::SSM::Parameter
+            Properties:
+              Description: The delegation vending machine Lambda Function ARN.
+              Name: Route53DelegationVendingMachineArn
+              Type: String
+              Value: !GetAtt rLambdaFunction.Arn
+
+  rTargetAssumedRoleStackSet:
+    Type: AWS::CloudFormation::StackSet
+    DependsOn: rDelegationVendingMachineStackSet
+    Properties:
+      AutoDeployment:
+        Enabled: true
+        RetainStacksOnAccountRemoval: true
+      Capabilities:
+        - CAPABILITY_NAMED_IAM
+      Description: >-
+        Deploy the necessary IAM role to the specified AWS Organizations organizational units which will enable the
+        ability for the Route 53 Delegation Vending Machine to create hosted zones within the accounts in said
+        organizational units.
+      PermissionModel: SERVICE_MANAGED
+      StackInstancesGroup:
+        -
+          DeploymentTargets:
+            OrganizationalUnitIds: !Ref pTargetAssumedRoleOUIds
+          Regions:
+            - !Ref AWS::Region
+      StackSetName: !Sub Route53DelegationVendingMachineRole-${ AWS::StackName }
+      TemplateBody: !Sub |-
+        AWSTemplateFormatVersion: 2010-09-09
+        Description: IAM role created for use with the Route 53 Delegation Vending Machine.
+
+        Resources:
+          rIAMRole:
+            Type: AWS::IAM::Role
+            Properties:
+              AssumeRolePolicyDocument:
+                Statement:
+                  -
+                    Action:
+                      - sts:AssumeRole
+                    Effect: Allow
+                    Principal:
+                      AWS: arn:aws:iam::${ pDelegationVendingMachineAccount }:role/Route53DelegationVendingMachineExecutionRole
+                Version: 2012-10-17
+              Policies:
+                -
+                  PolicyDocument:
+                    Statement:
+                      -
+                        Action:
+                          - route53:CreateHostedZone
+                          - route53:DeleteHostedZone
+                        Effect: Allow
+                        Resource: "*"
+                    Version: 2012-10-17
+                  PolicyName: Route53DelegationVendingMachineRolePolicy-${ pDelegationVendingMachineAccount }
+              RoleName: Route53DelegationVendingMachineRole-${ pDelegationVendingMachineAccount }

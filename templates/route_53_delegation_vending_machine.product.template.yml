@@ -1,0 +1,60 @@
+# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# https://aws.amazon.com/agreement
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Deploys the Route 53 Delegation Vending Machine Service Catalog product.  The Route 53 Delegation Vending Machine
+  will create a Route 53 hosted zone in the specified account and create a delegation NS record to said zone in the
+  parent zone found on this account.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: Hosted Zone Configuration
+        Parameters:
+          - pParentHostedZoneId
+          - pSubdomainZoneName
+      -
+        Label:
+          default: Target Account Configuration
+        Parameters:
+          - pTargetAccount
+    ParameterLabels:
+      pParentHostedZoneId:
+        default: Parent Hosted Zone ID
+      pSubdomainZoneName:
+        default: Full Subdomain Zone Name
+      pTargetAccount:
+        default: Target Account ID
+
+Parameters:
+  pParentHostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: >-
+      The parent Route 53 hosted zone ID that will delegate to the subdomain hosted zone to be created by the vending
+      machine in the target account.
+
+  pSubdomainZoneName:
+    Type: String
+    Description: >-
+      The fully-qualified name of the subdomain Route 53 hosted zone which will be created in the target account.
+      Ensure the subdomain zone name appropriately falls within the hierarchy of the selected parent hosted zone;
+      otherwise, the delegation will not function.  The final '.' in the hostec zone name is not required.
+
+  pTargetAccount:
+    Type: String
+    AllowedPattern: ^\d{12}$
+    Description: The target AWS account ID within which the subdomain Route 53 hosted zone will be created.
+
+Resources:
+  rCustomDelegationVendingMachine:
+    Type: Custom::DelegationVendingMachine
+    Properties:
+      ParentAccount: !Ref AWS::AccountId
+      ParentHostedZoneId: !Ref pParentHostedZoneId
+      ServiceToken: "{{resolve:ssm:Route53DelegationVendingMachineArn:1}}"
+      SubdomainZoneName: !Ref pSubdomainZoneName
+      TargetAccount: !Ref pTargetAccount
